@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import types
 from threading import Lock
 import unittest
 
@@ -20,6 +21,7 @@ from askiku_jobs.jobs import (
     JOBS_SEEN_CANDIDATES_STATE_KEY,
     JOBS_SOURCE_WATERMARKS_STATE_KEY,
     _fetch_happy_monday_postings,
+    _fetch_robota_ua_postings,
     _parse_jobs_ua_detail,
     _parse_work_ua_html,
     drain_jobs_alerts,
@@ -49,6 +51,24 @@ GOOD_DOU_RSS = """<?xml version="1.0" encoding="utf-8"?>
   </item>
 </channel></rss>
 """
+
+DOU_XHR_JSON = json.dumps(
+    {
+        "html": """
+        <li class="l-vacancy">
+          <div class="date">4 червня</div>
+          <div class="title">
+            <a class="vt" href="https://jobs.dou.ua/companies/xhrlab/vacancies/777/?from=list_hot">Python Backend Engineer</a>
+            <strong>в&nbsp;<a class="company" href="https://jobs.dou.ua/companies/xhrlab/vacancies/">XHRLab</a></strong>
+            <span class="cities bi bi-geo-alt-fill">Київ, віддалено</span>
+          </div>
+          <div class="sh-info">Remote Python, FastAPI, LLM automation. Є бронювання працівників.</div>
+        </li>
+        """,
+        "last": True,
+        "num": 1,
+    }
+)
 
 GOOD_WORK_HTML = """
 <a name="7890001"></a>
@@ -464,6 +484,68 @@ class JobsMonitorTests(unittest.TestCase):
         self.assertEqual(posting.remote_mode, "remote")
         self.assertEqual(posting.posted_at, "2026-06-04T10:17:43+00:00")
 
+    def test_fetch_job_sources_parses_dou_xhr_posting_in_heavy_mode(self) -> None:
+        fetched_urls: list[str] = []
+
+        def fetcher(url: str) -> str:
+            fetched_urls.append(url)
+            if "jobs.dou.ua/vacancies/xhr-load/" in url and "count=0" in url:
+                return DOU_XHR_JSON
+            if "jobs.dou.ua" in url:
+                return EMPTY_RSS
+            if "api.robota.ua/vacancy/search" in url:
+                return EMPTY_ROBOTA_JSON
+            return EMPTY_WORK_HTML
+
+        postings = [
+            posting
+            for posting in fetch_job_sources(fetcher=fetcher, mode="heavy")
+            if posting.url == "https://jobs.dou.ua/companies/xhrlab/vacancies/777/?from=list_hot"
+        ]
+
+        self.assertEqual(len(postings), 1)
+        self.assertTrue(any("jobs.dou.ua/vacancies/xhr-load/" in url for url in fetched_urls))
+        self.assertEqual(postings[0].source, "DOU")
+        self.assertEqual(postings[0].company, "XHRLab")
+        self.assertEqual(postings[0].remote_mode, "remote")
+        self.assertIn("бронювання працівників", postings[0].summary.lower())
+        self.assertTrue(postings[0].source_query.startswith("xhr:"))
+
+    def test_fetch_job_sources_isolates_dou_xhr_failures(self) -> None:
+        def fetcher(url: str) -> str:
+            if "jobs.dou.ua/vacancies/xhr-load/" in url:
+                raise RuntimeError("xhr failed")
+            if "jobs.dou.ua" in url:
+                return GOOD_DOU_RSS
+            if "api.robota.ua/vacancy/search" in url:
+                return EMPTY_ROBOTA_JSON
+            return EMPTY_WORK_HTML
+
+        postings = fetch_job_sources(fetcher=fetcher, mode="heavy")
+
+        self.assertTrue(any(posting.source == "DOU" for posting in postings))
+        self.assertTrue(
+            any(
+                posting.source == "internal" and "DOU XHR:" in posting.summary
+                for posting in postings
+            )
+        )
+
+    def test_fetch_job_sources_skips_dou_xhr_in_light_mode(self) -> None:
+        fetched_urls: list[str] = []
+
+        def fetcher(url: str) -> str:
+            fetched_urls.append(url)
+            if "jobs.dou.ua" in url:
+                return EMPTY_RSS
+            if "api.robota.ua/vacancy/search" in url:
+                return EMPTY_ROBOTA_JSON
+            return EMPTY_WORK_HTML
+
+        fetch_job_sources(fetcher=fetcher, mode="light")
+
+        self.assertFalse(any("jobs.dou.ua/vacancies/xhr-load/" in url for url in fetched_urls))
+
     def test_fetch_job_sources_parses_happy_monday_with_detail_evidence(self) -> None:
         def fetcher(url: str) -> str:
             if "happymonday.ua/jobs/1854323" in url:
@@ -566,6 +648,41 @@ class JobsMonitorTests(unittest.TestCase):
         self.assertEqual(posting.location, "Київ")
         self.assertEqual(posting.remote_mode, "remote")
         self.assertEqual(posting.posted_at, "3 березня 2025")
+        self.assertEqual(score_job(posting).reservation_confidence, "direct")
+
+    def test_jobs_ua_detail_uses_optional_text_extraction_for_hidden_evidence(self) -> None:
+        fake_trafilatura = types.SimpleNamespace(
+            extract=lambda _html, **_kwargs: (
+                "Remote Python, FastAPI, LLM automation. Є бронювання працівників."
+            )
+        )
+        previous = sys.modules.get("trafilatura")
+        sys.modules["trafilatura"] = fake_trafilatura
+        try:
+            posting = _parse_jobs_ua_detail(
+                """
+                <main>
+                  <div class="b-vacancy-full js-item_full">
+                    <h1 class="default__full-title js-item_title">Python API Automation Engineer</h1>
+                    <div class="b-vacancy-full__row">
+                      <span class="label">Компанія:</span><span class="control">Fallback Labs</span>
+                    </div>
+                  </div>
+                </main>
+                """,
+                source_query="https://jobs.ua/vacancy/rabota-api",
+                url="https://jobs.ua/job-api-777",
+            )
+        finally:
+            if previous is None:
+                sys.modules.pop("trafilatura", None)
+            else:
+                sys.modules["trafilatura"] = previous
+
+        self.assertIsNotNone(posting)
+        assert posting is not None
+        self.assertIn("бронювання працівників", posting.summary.lower())
+        self.assertEqual(posting.remote_mode, "remote")
         self.assertEqual(score_job(posting).reservation_confidence, "direct")
 
     def test_fetch_job_sources_isolates_happy_monday_and_jobs_ua_failures(self) -> None:
@@ -742,7 +859,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_dedupes_sent_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -768,7 +885,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_includes_direct_reservation_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -792,7 +909,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_hides_perfect_fit_without_reservation_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -817,7 +934,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_soft_passes_low_fit_direct_reserved_remote_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             rss = """<?xml version="1.0" encoding="utf-8"?>
             <rss version="2.0"><channel>
@@ -845,7 +962,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_company_discovery_promotes_good_work_ua_near_miss_with_adjacent_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             discovery_fetches = 0
 
@@ -879,7 +996,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_company_discovery_can_promote_multiple_adjacent_matches_per_heavy_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             company_items = "\n".join(
                 f"""
@@ -923,7 +1040,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_company_discovery_budget_targets_best_near_misses_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             discovery_urls: list[str] = []
             low_items = "\n".join(
@@ -977,7 +1094,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_light_mode_skips_company_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             discovery_fetches = 0
 
@@ -1012,7 +1129,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_status_records_hard_gate_counts_source_health_and_evidence_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1052,7 +1169,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_hides_non_remote_even_with_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1069,7 +1186,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_happy_monday_reservation_still_requires_remote_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1092,7 +1209,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_jobs_ua_diia_city_without_reservation_stays_hidden(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1115,7 +1232,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_accepts_adjacent_company_reservation_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1138,7 +1255,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_adjacent_reservation_ignores_physical_armor_words(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1161,7 +1278,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_company_reservation_evidence_cache_reuses_adjacent_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             company_url = "https://jobs.dou.ua/companies/productlab/vacancies/"
             company_fetches = 0
@@ -1193,7 +1310,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_accepts_diia_city_company_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1210,7 +1327,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_adjacent_reservation_signal_takes_priority_over_diia_city_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1231,7 +1348,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_djinni_posting_uses_cross_source_company_reservation_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1277,7 +1394,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_accepts_robota_ua_reservation_badge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             robota_payload = json.dumps(
@@ -1332,9 +1449,59 @@ class JobsMonitorTests(unittest.TestCase):
             self.assertGreaterEqual(result["items"][0]["agent_delegate_pct"], 75)
             self.assertEqual(result["items"][0]["agent_delegate_label"], "agent_first")
 
+    def test_robota_ua_postings_paginates_dedupes_and_respects_detail_cap(self) -> None:
+        def item(vacancy_id: int) -> dict[str, object]:
+            return {
+                "id": vacancy_id,
+                "notebookId": 900 + vacancy_id,
+                "name": f"Python Backend Engineer {vacancy_id}",
+                "companyName": f"Robota Product {vacancy_id}",
+                "cityName": "Київ",
+                "date": "2026-06-04T10:00:00",
+                "scheduleId": 3,
+                "shortDescription": "Remote Python, FastAPI, API automation.",
+                "badges": [{"id": 1, "name": "Бронирование сотрудников"}],
+            }
+
+        page1 = [item(vacancy_id) for vacancy_id in range(100, 121)]
+        page2 = [item(120), item(130)]
+        search_urls: list[str] = []
+        detail_ids: list[int] = []
+
+        def fetcher(url: str) -> str:
+            if "api.robota.ua/vacancy/search" in url:
+                search_urls.append(url)
+                if "page=2" in url:
+                    return json.dumps({"documents": page2})
+                if "page=3" in url:
+                    return EMPTY_ROBOTA_JSON
+                return json.dumps({"documents": page1})
+            if "api.robota.ua/vacancy?id=" in url:
+                vacancy_id = int(url.rsplit("=", 1)[1])
+                detail_ids.append(vacancy_id)
+                detail = item(vacancy_id)
+                detail["description"] = "Remote Python, FastAPI, LLM, automation."
+                return json.dumps(detail)
+            return EMPTY_ROBOTA_JSON
+
+        postings = _fetch_robota_ua_postings(
+            fetcher=fetcher,
+            source_query=(
+                "https://api.robota.ua/vacancy/search?"
+                "keyWords=python&scheduleId=3&isReservation=true"
+            ),
+        )
+
+        self.assertTrue(any("page=2" in url for url in search_urls))
+        self.assertTrue(all("scheduleId=3" in url for url in search_urls))
+        self.assertTrue(all("isReservation=true" in url for url in search_urls))
+        self.assertEqual(len(detail_ids), 20)
+        self.assertEqual(len({posting.url for posting in postings}), 22)
+        self.assertTrue(any("vacancy130" in posting.url for posting in postings))
+
     def test_drain_jobs_alerts_hides_robota_ua_when_detail_is_not_remote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             robota_payload = json.dumps(
@@ -1384,7 +1551,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_drain_jobs_alerts_shows_education_label_without_hiding_required_degree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1406,7 +1573,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_new_mode_hides_stale_reserved_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1428,7 +1595,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_new_mode_hides_undated_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1450,7 +1617,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_backfill_mode_can_preview_stale_and_undated_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1475,7 +1642,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_new_mode_ranks_fresh_candidate_before_higher_score_stale_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1499,7 +1666,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_new_mode_hides_jobs_at_or_before_source_watermark(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
             storage.set_state(
                 JOBS_SOURCE_WATERMARKS_STATE_KEY,
@@ -1525,7 +1692,7 @@ class JobsMonitorTests(unittest.TestCase):
 
     def test_new_mode_updates_seen_cache_and_source_watermarks_after_real_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:
@@ -1549,10 +1716,66 @@ class JobsMonitorTests(unittest.TestCase):
             self.assertIsNotNone(watermarks_raw)
             self.assertIn("FreshOnly", seen_raw or "")
             self.assertIn("python бронювання", watermarks_raw or "")
+            seen = json.loads(seen_raw or "{}")
+            self.assertTrue(any(row.get("status") == "selected" for row in seen.values()))
+
+    def test_seen_candidates_records_recheckable_and_blocked_statuses(self) -> None:
+        blocked_rss = NO_RESERVATION_DOU_RSS.replace(
+            "</channel></rss>",
+            """
+              <item>
+                <title>Python Backend Engineer в DefenseLab, віддалено</title>
+                <link>https://jobs.dou.ua/companies/defenselab/vacancies/45/?utm_source=jobsrss</link>
+                <description>Remote Python, FastAPI, API automation. Є бронювання співробітників. Miltech defense systems.</description>
+                <pubDate>Thu, 04 Jun 2026 10:00:00 +0000</pubDate>
+              </item>
+            </channel></rss>
+            """,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
+            storage.initialize()
+
+            def fetcher(url: str) -> str:
+                if "city-backend.diia.gov.ua" in url:
+                    return _diia_registry_payload('"OTHER COMPANY"')
+                if "jobs.dou.ua" in url:
+                    return blocked_rss
+                return EMPTY_WORK_HTML
+
+            result = drain_jobs_alerts(
+                storage=storage,
+                fetcher=fetcher,
+                limit=5,
+                now=datetime(2026, 6, 4, 12, 0, tzinfo=UTC),
+            )
+
+            self.assertEqual(result["count"], 0)
+            seen = json.loads(storage.get_state(JOBS_SEEN_CANDIDATES_STATE_KEY) or "{}")
+            statuses = {row.get("title"): row for row in seen.values()}
+            no_signal = statuses["AI Automation Engineer в NoSignal Labs, віддалено"]
+            blocked = statuses["Python Backend Engineer в DefenseLab, віддалено"]
+
+            self.assertEqual(no_signal["decision"], "without_reservation")
+            self.assertEqual(no_signal["status"], "waiting_reservation_evidence")
+            self.assertEqual(no_signal["primary_block"], "reservation")
+            self.assertEqual(no_signal["reservation_confidence"], "unknown")
+            self.assertTrue(no_signal["remote"])
+            self.assertIn("recheck_after", no_signal)
+            self.assertEqual(blocked["status"], "blocked_defense")
+            self.assertEqual(blocked["primary_block"], "defense")
+            self.assertGreaterEqual(
+                result["status"]["candidate_status_counts"]["waiting_reservation_evidence"],
+                1,
+            )
+            self.assertGreaterEqual(
+                result["status"]["candidate_status_counts"]["blocked_defense"],
+                1,
+            )
 
     def test_dry_run_does_not_advance_seen_cache_or_source_watermarks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage = Storage(Path(tmp) / "asmonday.sqlite3")
             storage.initialize()
 
             def fetcher(url: str) -> str:

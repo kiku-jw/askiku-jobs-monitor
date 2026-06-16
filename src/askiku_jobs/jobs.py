@@ -5,14 +5,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from http.cookiejar import CookieJar
 from html import unescape
+import importlib
 from pathlib import PurePosixPath
 import hashlib
 import json
 import re
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 
@@ -98,6 +100,8 @@ DOU_QUERIES = (
     "ai automation without degree",
 )
 DOU_NEW_QUERIES = DOU_QUERIES
+DOU_XHR_MODES = {"heavy", "backfill"}
+DOU_XHR_PAGE_LIMIT = 2
 
 WORK_UA_URLS = (
     "https://www.work.ua/jobs-remote-python/?advs=1&deferment=1",
@@ -138,6 +142,8 @@ ROBOTA_UA_URLS = (
     "https://api.robota.ua/vacancy/search?keyWords=rpa&scheduleId=3&isReservation=true",
 )
 ROBOTA_UA_DETAIL_LIMIT = 20
+ROBOTA_UA_PAGE_LIMIT = 3
+ROBOTA_UA_PAGE_SIZE = 50
 
 HAPPY_MONDAY_URLS = (
     "https://happymonday.ua/jobs-search/software-engineering",
@@ -750,6 +756,11 @@ def fetch_job_sources(fetcher: Fetcher | None = None, *, mode: str = "new") -> l
             postings.extend(_parse_dou_rss(fetch(url), source_query=query))
         except Exception:
             problems.append(f"DOU:{query}")
+        if mode in DOU_XHR_MODES:
+            try:
+                postings.extend(_fetch_dou_xhr_postings(fetcher=fetch, query=query))
+            except Exception:
+                problems.append(f"DOU XHR:{query}")
 
     for url in work_urls:
         try:
@@ -1000,6 +1011,13 @@ def drain_jobs_alerts(
             sent_before=sent_before,
             min_score=min_score,
         ),
+        "candidate_status_counts": _candidate_status_counts(
+            scored=scored,
+            freshness_reasons=freshness_reasons,
+            selected_fingerprints=selected_fingerprints,
+            sent_before=sent_before,
+            min_score=min_score,
+        ),
         "source_health": _source_health_rows(postings=postings, problems=problems),
         "source_watermarks": len(source_watermarks),
         "seen_candidates": len(_load_seen_candidates(storage)),
@@ -1112,6 +1130,15 @@ def jobs_status_panel(storage: Storage) -> str:
             f"no_reservation={int(gate_counts.get('without_reservation') or 0)}, "
             f"blocked={int(gate_counts.get('blocked') or 0)}"
         )
+    candidate_status_counts = status.get("candidate_status_counts")
+    if isinstance(candidate_status_counts, dict):
+        parts = [
+            f"{key}={int(value or 0)}"
+            for key, value in sorted(candidate_status_counts.items())
+            if int(value or 0) > 0
+        ]
+        if parts:
+            lines.append("Candidate statuses: " + ", ".join(parts[:8]))
     source_health = status.get("source_health")
     if isinstance(source_health, list) and source_health:
         lines.append(f"Source health rows: {len(source_health)}")
@@ -1968,6 +1995,15 @@ def _update_seen_candidates(
             continue
         previous = seen.get(fingerprint)
         first_seen = str(previous.get("first_seen") or now_iso) if previous else now_iso
+        gate_decision = _job_gate_decision(item, min_score=min_score)
+        status = _candidate_status(
+            item,
+            selected_fingerprints=selected_fingerprints,
+            sent_before=sent_before,
+            freshness_reason=freshness_reason,
+            min_score=min_score,
+        )
+        recheck_after = _candidate_recheck_after(status=status, now=now)
         seen[fingerprint] = {
             "first_seen": first_seen,
             "last_seen": now_iso,
@@ -1977,6 +2013,11 @@ def _update_seen_candidates(
             "title": posting.title,
             "company": posting.company,
             "url": posting.url,
+            "score": item.score,
+            "reservation_confidence": item.reservation_confidence,
+            "remote": _has_remote_signal(posting),
+            "primary_block": gate_decision.primary_block,
+            "status": status,
             "decision": _seen_decision(
                 item,
                 selected_fingerprints=selected_fingerprints,
@@ -1985,7 +2026,67 @@ def _update_seen_candidates(
                 min_score=min_score,
             ),
         }
+        if recheck_after:
+            seen[fingerprint]["recheck_after"] = recheck_after
     _save_seen_candidates(storage, seen)
+
+
+def _candidate_status_counts(
+    *,
+    scored: list[ScoredJob],
+    freshness_reasons: list[str],
+    selected_fingerprints: set[str],
+    sent_before: set[str],
+    min_score: int,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item, freshness_reason in zip(scored, freshness_reasons, strict=True):
+        status = _candidate_status(
+            item,
+            selected_fingerprints=selected_fingerprints,
+            sent_before=sent_before,
+            freshness_reason=freshness_reason,
+            min_score=min_score,
+        )
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _candidate_status(
+    item: ScoredJob,
+    *,
+    selected_fingerprints: set[str],
+    sent_before: set[str],
+    freshness_reason: str,
+    min_score: int,
+) -> str:
+    fingerprint = job_fingerprint(item.posting)
+    if fingerprint in selected_fingerprints:
+        return "selected"
+    if fingerprint in sent_before and _is_alertable_job(item, min_score=min_score):
+        return "qualified_duplicate"
+    if freshness_reason:
+        return f"blocked_{freshness_reason}"
+    decision = _job_gate_decision(item, min_score=min_score)
+    if decision.alertable:
+        return "qualified"
+    if decision.primary_block == "defense":
+        return "blocked_defense"
+    if decision.primary_block == "remote":
+        return "blocked_no_remote"
+    if decision.primary_block == "reservation":
+        if decision.remote == "pass" and item.score >= min_score - 14:
+            return "waiting_reservation_evidence"
+        return "blocked_no_reservation"
+    if decision.primary_block == "score":
+        return "blocked_low_score"
+    return "hidden"
+
+
+def _candidate_recheck_after(*, status: str, now: datetime) -> str:
+    if status != "waiting_reservation_evidence":
+        return ""
+    return (now + timedelta(days=3)).replace(microsecond=0).isoformat()
 
 
 def _seen_decision(
@@ -2612,12 +2713,91 @@ def _dou_feed_url(query: str) -> str:
     return f"https://jobs.dou.ua/vacancies/feeds/?search={quote_plus(query)}&remote"
 
 
+def _dou_search_url(query: str) -> str:
+    return f"https://jobs.dou.ua/vacancies/?search={quote_plus(query)}&remote"
+
+
+def _dou_xhr_url(query: str, *, count: int) -> str:
+    return (
+        "https://jobs.dou.ua/vacancies/xhr-load/?"
+        f"{urlencode({'search': query, 'count': max(0, int(count))})}"
+    )
+
+
 def _djinni_feed_url(query: str) -> str:
     base = "https://djinni.co/jobs/rss/?region=eu&employment=remote"
     query = query.strip()
     if not query:
         return base
     return f"{base}&keywords={quote_plus(query)}"
+
+
+def _fetch_dou_xhr_postings(*, fetcher: Fetcher, query: str) -> list[JobPosting]:
+    postings: list[JobPosting] = []
+    count = 0
+    for _ in range(DOU_XHR_PAGE_LIMIT):
+        raw = _fetch_dou_xhr_payload(fetcher=fetcher, query=query, count=count)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            break
+        page_postings = _parse_dou_xhr_html(
+            str(payload.get("html") or ""),
+            source_query=f"xhr:{query}",
+        )
+        if not page_postings:
+            break
+        postings.extend(page_postings)
+        if bool(payload.get("last")):
+            break
+        next_count = int(payload.get("num") or 0)
+        if next_count <= count:
+            next_count = count + len(page_postings)
+        count = next_count
+    return postings
+
+
+def _fetch_dou_xhr_payload(*, fetcher: Fetcher, query: str, count: int) -> str:
+    if fetcher is not _fetch_url:
+        return fetcher(_dou_xhr_url(query, count=count))
+    page_url = _dou_search_url(query)
+    jar = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(jar))
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html",
+    }
+    page_response = opener.open(Request(page_url, headers=headers), timeout=18)
+    page_charset = page_response.headers.get_content_charset() or "utf-8"
+    page_text = page_response.read(160_000).decode(page_charset, errors="ignore")
+    csrf = _dou_csrf_token(page_text)
+    xhr_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": page_url,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if csrf:
+        xhr_headers["X-CSRFToken"] = csrf
+    body = urlencode({"search": query, "count": max(0, int(count))}).encode()
+    xhr_response = opener.open(
+        Request("https://jobs.dou.ua/vacancies/xhr-load/", data=body, headers=xhr_headers),
+        timeout=18,
+    )
+    xhr_charset = xhr_response.headers.get_content_charset() or "utf-8"
+    return xhr_response.read(220_000).decode(xhr_charset, errors="ignore")
+
+
+def _dou_csrf_token(text: str) -> str:
+    patterns = (
+        r'name=["\']csrfmiddlewaretoken["\'][^>]*value=["\']([^"\']+)',
+        r'csrfmiddlewaretoken["\']?\s*[:=]\s*["\']([^"\']+)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match is not None:
+            return match.group(1).strip()
+    return ""
 
 
 def _parse_dou_rss(text: str, *, source_query: str) -> list[JobPosting]:
@@ -2643,6 +2823,65 @@ def _parse_dou_rss(text: str, *, source_query: str) -> list[JobPosting]:
             )
         )
     return postings
+
+
+def _parse_dou_xhr_html(text: str, *, source_query: str) -> list[JobPosting]:
+    postings: list[JobPosting] = []
+    blocks = re.findall(
+        r'<li\b[^>]*class="[^"]*\bl-vacancy\b[^"]*"[^>]*>.*?</li>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for block in blocks:
+        title_match = re.search(
+            r'<a\b[^>]*class="[^"]*\bvt\b[^"]*"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if title_match is None:
+            continue
+        title = _strip_html(title_match.group("title"))
+        url = unescape(title_match.group("href")).strip()
+        if not url.startswith("http"):
+            url = urljoin("https://jobs.dou.ua", url)
+        company_match = re.search(
+            r'<a\b[^>]*class="[^"]*\bcompany\b[^"]*"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<company>.*?)</a>',
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        company = _strip_html(company_match.group("company")) if company_match else ""
+        company_url = (
+            urljoin("https://jobs.dou.ua", unescape(company_match.group("href")).strip())
+            if company_match
+            else ""
+        )
+        location = _dou_xhr_text_by_class(block, "cities")
+        summary = _dou_xhr_text_by_class(block, "sh-info")
+        date_text = _dou_xhr_text_by_class(block, "date")
+        postings.append(
+            JobPosting(
+                source="DOU",
+                title=title,
+                company=company,
+                url=url,
+                summary=summary,
+                location=location,
+                remote_mode="remote" if _has_remote_text(f"{title} {summary} {location}") else "",
+                posted_at=date_text,
+                source_query=source_query,
+                company_url=company_url,
+            )
+        )
+    return postings
+
+
+def _dou_xhr_text_by_class(block: str, class_name: str) -> str:
+    match = re.search(
+        rf'<[^>]+class="[^"]*\b{re.escape(class_name)}\b[^"]*"[^>]*>(?P<value>.*?)</[^>]+>',
+        block,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _strip_html(match.group("value")) if match is not None else ""
 
 
 def _fetch_djinni_postings(*, fetcher: Fetcher, source_query: str) -> list[JobPosting]:
@@ -2810,7 +3049,10 @@ def _enrich_happy_monday_posting(posting: JobPosting, *, fetcher: Fetcher) -> Jo
     except Exception:
         return posting
     fragment = _detail_fragment(detail)
-    detail_text = _strip_html(fragment)
+    detail_text = _join_nonempty_texts(
+        [_strip_html(fragment), _extract_detail_text_fallback(detail)],
+        limit=1800,
+    )
     if not detail_text:
         return posting
     title = _first_heading_text(fragment) or posting.title
@@ -2974,7 +3216,10 @@ def _parse_jobs_ua_detail(
     if not company:
         company = _jobs_ua_visible_company(fragment)
     description = _jsonld_text(node.get("description") if node else "")
-    summary = _join_nonempty_texts([description, visible_text], limit=1400)
+    summary = _join_nonempty_texts(
+        [description, visible_text, _extract_detail_text_fallback(text)],
+        limit=1400,
+    )
     location = _jobs_ua_jsonld_location(node) if node else ""
     if not location:
         location = _location_hint_from_text(visible_text)
@@ -3255,6 +3500,28 @@ def _detail_fragment(text: str) -> str:
     return text
 
 
+def _extract_detail_text_fallback(text: str) -> str:
+    try:
+        module = importlib.import_module("trafilatura")
+    except Exception:
+        return ""
+    extract = getattr(module, "extract", None)
+    if not callable(extract):
+        return ""
+    try:
+        extracted = extract(
+            text,
+            include_comments=False,
+            include_tables=False,
+            favor_recall=True,
+        )
+    except Exception:
+        return ""
+    if not isinstance(extracted, str):
+        return ""
+    return _strip_html(extracted)
+
+
 def _location_hint_from_text(text: str) -> str:
     clean = _strip_html(text)
     for location in ("Київ", "Львів", "Дніпро", "Одеса", "Харків", "Україна", "Ukraine"):
@@ -3372,15 +3639,32 @@ def _work_ua_card_has_reservation_badge(block: str) -> bool:
 
 
 def _fetch_robota_ua_postings(*, fetcher: Fetcher, source_query: str) -> list[JobPosting]:
-    payload = json.loads(fetcher(source_query))
-    documents = payload.get("documents") if isinstance(payload, dict) else None
-    if not isinstance(documents, list):
-        return []
+    documents: list[dict[str, Any]] = []
+    seen_documents: set[str] = set()
+    for page in range(1, ROBOTA_UA_PAGE_LIMIT + 1):
+        payload = json.loads(fetcher(_robota_ua_page_url(source_query, page=page)))
+        page_documents = payload.get("documents") if isinstance(payload, dict) else None
+        if not isinstance(page_documents, list) or not page_documents:
+            break
+        added = 0
+        for item in page_documents:
+            if not isinstance(item, dict):
+                continue
+            key = _robota_document_key(item)
+            if not key or key in seen_documents:
+                continue
+            seen_documents.add(key)
+            documents.append(item)
+            added += 1
+        if added == 0:
+            break
     postings: list[JobPosting] = []
-    for item in documents[:ROBOTA_UA_DETAIL_LIMIT]:
-        if not isinstance(item, dict):
-            continue
-        detail = _fetch_robota_ua_detail(fetcher=fetcher, item=item)
+    detail_fetches = 0
+    for item in documents:
+        detail = None
+        if detail_fetches < ROBOTA_UA_DETAIL_LIMIT:
+            detail_fetches += 1
+            detail = _fetch_robota_ua_detail(fetcher=fetcher, item=item)
         source = detail or item
         if not _robota_is_remote(source):
             continue
@@ -3388,6 +3672,23 @@ def _fetch_robota_ua_postings(*, fetcher: Fetcher, source_query: str) -> list[Jo
         if posting is not None:
             postings.append(posting)
     return postings
+
+
+def _robota_ua_page_url(source_query: str, *, page: int) -> str:
+    split = urlsplit(source_query)
+    params = dict(parse_qsl(split.query, keep_blank_values=True))
+    params.setdefault("count", str(ROBOTA_UA_PAGE_SIZE))
+    params["page"] = str(max(1, int(page)))
+    return urlunsplit((split.scheme, split.netloc, split.path, urlencode(params), split.fragment))
+
+
+def _robota_document_key(item: dict[str, Any]) -> str:
+    vacancy_id = str(item.get("id") or "").strip()
+    if vacancy_id:
+        return vacancy_id
+    title = str(item.get("name") or "").strip().lower()
+    company = str(item.get("companyName") or "").strip().lower()
+    return f"{company}|{title}" if title or company else ""
 
 
 def _fetch_robota_ua_detail(*, fetcher: Fetcher, item: dict[str, Any]) -> dict[str, Any] | None:
