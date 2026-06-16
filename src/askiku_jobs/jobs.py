@@ -30,6 +30,7 @@ JOBS_SEEN_CANDIDATES_STATE_KEY = "jobs.seen_candidates"
 JOBS_SOURCE_WATERMARKS_STATE_KEY = "jobs.source_watermarks"
 
 DEFAULT_MIN_SCORE = 55
+DIRECT_RESERVATION_LOW_FIT_MIN_SCORE = 45
 DEFAULT_LIMIT = 3
 DEFAULT_MAX_AGE_HOURS = 72
 DIIA_CITY_REGISTRY_TTL = timedelta(days=7)
@@ -38,6 +39,7 @@ COMPANY_RESERVATION_EVIDENCE_NEGATIVE_TTL = timedelta(days=2)
 COMPANY_RESERVATION_EVIDENCE_CACHE_LIMIT = 500
 COMPANY_RESERVATION_DISCOVERY_LIMIT = 8
 COMPANY_RESERVATION_DISCOVERY_RUN_LIMIT = 12
+COMPANY_RESERVATION_DISCOVERY_PROMOTION_LIMIT = 3
 SEEN_CANDIDATES_LIMIT = 2000
 RESERVATION_EVIDENCE_LEDGER_LIMIT = 500
 DIIA_CITY_REGISTRY_URL = "https://city-backend.diia.gov.ua/api/front/registry/resident?page={page}"
@@ -118,11 +120,7 @@ WORK_UA_URLS = (
     "https://www.work.ua/jobs-remote/?search=python%20%D0%B1%D0%B5%D0%B7%20%D0%B2%D0%B8%D1%89%D0%BE%D1%97%20%D0%BE%D1%81%D0%B2%D1%96%D1%82%D0%B8",
     "https://www.work.ua/jobs-remote/?search=ai%20automation%20without%20degree",
 )
-WORK_UA_NEW_URLS = (
-    "https://www.work.ua/jobs-remote-python/?advs=1&deferment=1",
-    "https://www.work.ua/jobs-remote/?search=python&deferment=1",
-    "https://www.work.ua/jobs-remote-python/?advs=1",
-)
+WORK_UA_NEW_URLS = WORK_UA_URLS
 
 ROBOTA_UA_URLS = (
     "https://api.robota.ua/vacancy/search?keyWords=python&scheduleId=3&isReservation=true",
@@ -734,12 +732,7 @@ class ScoredJob:
 
     @property
     def is_alertable(self) -> bool:
-        return (
-            self.score >= DEFAULT_MIN_SCORE
-            and self.reservation_confidence in ALERTABLE_RESERVATION_CONFIDENCES
-            and _has_remote_signal(self.posting)
-            and not self.disqualifiers
-        )
+        return _job_gate_decision(self, min_score=DEFAULT_MIN_SCORE).alertable
 
 
 def fetch_job_sources(fetcher: Fetcher | None = None, *, mode: str = "new") -> list[JobPosting]:
@@ -1159,7 +1152,7 @@ def _job_gate_decision(item: ScoredJob, *, min_score: int) -> JobGateDecision:
     remote = "pass" if _has_remote_signal(item.posting) else "fail"
     education = "risk" if item.education_requirement == "required" else "pass"
     defense = "fail" if item.disqualifiers else "pass"
-    score = "pass" if item.score >= min_score else "fail"
+    score = "pass" if _passes_score_gate(item, min_score=min_score) else "fail"
     if defense == "fail":
         primary_block = "defense"
     elif (
@@ -1233,6 +1226,15 @@ def _gate_counts(
     return counts
 
 
+def _passes_score_gate(item: ScoredJob, *, min_score: int) -> bool:
+    if item.score >= min_score:
+        return True
+    return (
+        item.reservation_confidence == "direct"
+        and item.score >= DIRECT_RESERVATION_LOW_FIT_MIN_SCORE
+    )
+
+
 def _source_health_rows(
     *,
     postings: list[JobPosting],
@@ -1304,9 +1306,16 @@ def _has_remote_signal(posting: JobPosting) -> bool:
     text = _score_text(posting).lower()
     if "full remote" in text or "fully remote" in text:
         return True
-    if any(signal in text for signal in HYBRID_OR_OFFICE_SIGNALS):
-        return False
     return any(signal in text for signal in REMOTE_SIGNALS)
+
+
+def _remote_risk_reason(posting: JobPosting) -> str:
+    text = _score_text(posting).lower()
+    if any(signal in text for signal in REMOTE_SIGNALS) and any(
+        signal in text for signal in HYBRID_OR_OFFICE_SIGNALS
+    ):
+        return "remote unclear/optional office"
+    return ""
 
 
 def _normalize_jobs_mode(mode: str) -> str:
@@ -1470,6 +1479,9 @@ def score_job(
 
     if _has_remote_signal(posting):
         reasons.append("remote")
+    remote_risk = _remote_risk_reason(posting)
+    if remote_risk:
+        reasons.append(f"risk: {remote_risk}")
 
     if reservation_confidence == "direct":
         reasons.append("mentions reservation")
@@ -1614,7 +1626,7 @@ def _apply_company_discovery_to_ranked_near_misses(
     for _key, index, item in rows:
         if fetch_budget[0] <= 0:
             break
-        if promoted >= 1:
+        if promoted >= COMPANY_RESERVATION_DISCOVERY_PROMOTION_LIMIT:
             break
         evidence = _company_discovery_reservation_evidence(
             item.posting,
@@ -2541,6 +2553,8 @@ def render_jobs_digest(items: list[ScoredJob]) -> str:
             f"образование: {_education_label(item.education_requirement)}; "
             f"remote: {_remote_label(posting)}"
         )
+        if item.reservation_confidence == "direct" and item.score < DEFAULT_MIN_SCORE:
+            lines.append("fit низкий: показано из-за прямой брони и remote")
         lines.append(f"AI-автономность: ~{item.agent_delegate_pct}% ({item.agent_delegate_label})")
         if item.reasons:
             lines.append("почему: " + "; ".join(item.reasons[:4]))

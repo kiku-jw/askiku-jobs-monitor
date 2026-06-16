@@ -15,6 +15,10 @@ Shown candidates must have:
 
 Higher-education requirements are not a hide gate. They are reported as an education risk and can lower score.
 
+Direct reservation plus remote can soft-pass below the normal score threshold when the score is still at least 45/100. The digest marks those as low fit.
+
+If a posting explicitly mentions remote work but also mentions office or hybrid wording, it is treated as remote with a risk label instead of being hidden.
+
 Diia.City residency is context only. It must not make a vacancy alertable by itself.
 
 ## Sources
@@ -55,7 +59,7 @@ print(result["message"] or "[SILENT]")
 
 - `dry_run=True` never marks candidates as sent.
 - `light` skips company discovery.
-- `heavy` spends a bounded company-discovery budget to look for neighboring vacancies with reservation evidence.
+- `heavy` spends a bounded company-discovery budget to look for neighboring vacancies with reservation evidence and can promote up to 3 adjacent matches per run.
 - `backfill` disables freshness gates and is intended for manual research, not cron alerts.
 
 ## Tests

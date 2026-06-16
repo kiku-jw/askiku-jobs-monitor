@@ -711,6 +711,20 @@ class JobsMonitorTests(unittest.TestCase):
         self.assertEqual(scored.education_requirement, "required")
         self.assertTrue(scored.is_alertable)
 
+    def test_score_job_treats_explicit_remote_with_optional_office_as_remote_risk(self) -> None:
+        posting = JobPosting(
+            source="test",
+            title="Software Engineer",
+            company="RemoteOptional",
+            url="https://example.ua/jobs/remote-office-optional",
+            summary="Remote work. Office optional. Python API. Є бронювання.",
+        )
+
+        scored = score_job(posting)
+
+        self.assertTrue(scored.is_alertable)
+        self.assertIn("risk: remote unclear/optional office", scored.reasons)
+
     def test_score_job_blocks_war_related_roles(self) -> None:
         posting = JobPosting(
             source="test",
@@ -801,6 +815,34 @@ class JobsMonitorTests(unittest.TestCase):
             self.assertIn("нет direct/adjacent брони", status)
             self.assertIn("AI Automation Engineer в NoSignal Labs", status)
 
+    def test_drain_jobs_alerts_soft_passes_low_fit_direct_reserved_remote_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage.initialize()
+            rss = """<?xml version="1.0" encoding="utf-8"?>
+            <rss version="2.0"><channel>
+              <item>
+                <title>Software Engineer в LowFit Direct, віддалено</title>
+                <link>https://jobs.dou.ua/companies/lowfit/vacancies/45/?utm_source=jobsrss</link>
+                <description>Remote Python. Є бронювання працівників.</description>
+                <pubDate>Thu, 04 Jun 2026 10:17:43 +0000</pubDate>
+              </item>
+            </channel></rss>
+            """
+
+            def fetcher(url: str) -> str:
+                if "city-backend.diia.gov.ua" in url:
+                    return _diia_registry_payload('"OTHER COMPANY"')
+                if "jobs.dou.ua" in url:
+                    return rss
+                return EMPTY_WORK_HTML
+
+            result = drain_jobs_alerts(storage=storage, fetcher=fetcher, limit=5, now=TEST_NOW)
+
+            self.assertEqual(result["count"], 1)
+            self.assertIn("fit низкий", result["message"])
+            self.assertEqual(result["items"][0]["reservation_confidence"], "direct")
+
     def test_company_discovery_promotes_good_work_ua_near_miss_with_adjacent_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
@@ -834,6 +876,50 @@ class JobsMonitorTests(unittest.TestCase):
             self.assertEqual(evidence["kind"], "adjacent")
             self.assertEqual(evidence["source_url"], "https://www.work.ua/jobs/7890004/")
             self.assertIn("бронювання працівників", evidence["quote"].lower())
+
+    def test_company_discovery_can_promote_multiple_adjacent_matches_per_heavy_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "askiku_jobs.sqlite3")
+            storage.initialize()
+            company_items = "\n".join(
+                f"""
+                <item>
+                  <title>AI Automation Engineer в MultiFit {i}, віддалено</title>
+                  <link>https://jobs.dou.ua/companies/multifit{i}/vacancies/{i}/?utm_source=jobsrss</link>
+                  <description>Remote Python FastAPI LLM RAG Telegram API PostgreSQL automation.</description>
+                  <pubDate>Thu, 04 Jun 2026 10:{i:02d}:00 +0000</pubDate>
+                </item>
+                """
+                for i in range(3)
+            )
+            rss = f"""<?xml version="1.0" encoding="utf-8"?>
+            <rss version="2.0"><channel>{company_items}</channel></rss>
+            """
+
+            def fetcher(url: str) -> str:
+                if "city-backend.diia.gov.ua" in url:
+                    return _diia_registry_payload('"OTHER COMPANY"')
+                if "jobs.dou.ua" in url:
+                    return rss
+                if "www.work.ua/jobs-remote/" in url:
+                    for i in range(3):
+                        if f"MultiFit+{i}" in url:
+                            return WORK_COMPANY_DISCOVERY_WITH_RESERVATION.replace(
+                                "NoSignal Labs",
+                                f"MultiFit {i}",
+                            )
+                    return EMPTY_WORK_HTML
+                if "api.robota.ua/vacancy/search" in url:
+                    return EMPTY_ROBOTA_JSON
+                return EMPTY_WORK_HTML
+
+            result = drain_jobs_alerts(storage=storage, fetcher=fetcher, limit=5, now=TEST_NOW)
+
+            self.assertEqual(result["count"], 3)
+            self.assertEqual(
+                {item["reservation_confidence"] for item in result["items"]},
+                {"adjacent"},
+            )
 
     def test_company_discovery_budget_targets_best_near_misses_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -875,7 +961,8 @@ class JobsMonitorTests(unittest.TestCase):
                         "TopFit Labs",
                     )
                 if "www.work.ua/jobs-remote/" in url:
-                    discovery_urls.append(url)
+                    if "LowCompany" in url:
+                        discovery_urls.append(url)
                     return EMPTY_WORK_HTML
                 if "api.robota.ua/vacancy/search" in url:
                     return EMPTY_ROBOTA_JSON
@@ -1179,9 +1266,13 @@ class JobsMonitorTests(unittest.TestCase):
 
         self.assertTrue(any("work.ua" in url and "deferment=1" in url for url in fetched_urls))
         self.assertTrue(any("robota.ua" in url and "isReservation=true" in url for url in fetched_urls))
-        self.assertTrue(any("n8n" in url.lower() for url in fetched_urls))
-        self.assertTrue(any("backend" in url.lower() for url in fetched_urls))
-        self.assertTrue(any("data%20engineer" in url.lower() for url in fetched_urls))
+        work_urls = [url for url in fetched_urls if "work.ua" in url]
+        self.assertTrue(any("search=backend" in url.lower() for url in work_urls))
+        self.assertTrue(any("search=llm" in url.lower() for url in work_urls))
+        self.assertTrue(any("search=fastapi" in url.lower() for url in work_urls))
+        self.assertTrue(any("search=telegram" in url.lower() for url in work_urls))
+        self.assertTrue(any("search=n8n" in url.lower() for url in work_urls))
+        self.assertTrue(any("search=rpa" in url.lower() for url in work_urls))
         self.assertTrue(any("djinni.co" in url for url in fetched_urls))
 
     def test_drain_jobs_alerts_accepts_robota_ua_reservation_badge(self) -> None:
