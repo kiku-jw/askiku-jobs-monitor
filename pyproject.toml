@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "askiku-jobs-monitor"
+version = "0.1.0"
+description = "Portable job-search monitor for remote Ukrainian IT roles with reservation evidence."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Nick / KikuAI" }
+]
+dependencies = []
+
+[project.scripts]
+askiku-jobs = "askiku_jobs.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
