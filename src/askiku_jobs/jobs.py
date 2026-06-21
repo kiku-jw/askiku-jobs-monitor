@@ -19,6 +19,8 @@ from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_ope
 from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 
+import requests
+
 from .storage import Storage
 
 
@@ -97,6 +99,11 @@ USER_AGENT = (
     "AskikuJobMonitor/1.0 "
     "(portable job search monitor; contact via repository owner)"
 )
+ROBOTA_UA_REQUEST_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json,text/html,application/rss+xml",
+}
+ROBOTA_UA_HOST_FALLBACKS = ("api.robota.ua", "ua-api.robota.ua", "api.rabota.ua")
 
 DOU_QUERIES = (
     "python бронювання",
@@ -3579,6 +3586,44 @@ def _fetch_url(url: str, *, max_bytes: int | None = None) -> str:
         return response.read().decode(charset, errors="ignore")
 
 
+def _fetch_robota_ua_json(*, fetcher: Fetcher, url: str) -> dict[str, Any]:
+    if fetcher is not _fetch_url:
+        payload = json.loads(fetcher(url))
+    else:
+        payload = json.loads(_fetch_robota_ua_url(url))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _fetch_robota_ua_url(url: str) -> str:
+    last_error: requests.RequestException | None = None
+    for candidate in _robota_ua_url_candidates(url):
+        try:
+            response = requests.get(
+                candidate,
+                headers=ROBOTA_UA_REQUEST_HEADERS,
+                timeout=18,
+            )
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No Robota.ua URL candidates")
+
+
+def _robota_ua_url_candidates(url: str) -> list[str]:
+    split = urlsplit(url)
+    if split.netloc not in ROBOTA_UA_HOST_FALLBACKS:
+        return [url]
+    candidates: list[str] = []
+    for host in (split.netloc, *ROBOTA_UA_HOST_FALLBACKS):
+        candidate = urlunsplit((split.scheme, host, split.path, split.query, split.fragment))
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def _https_context() -> ssl.SSLContext:
     global _HTTPS_CONTEXT
     if _HTTPS_CONTEXT is not None:
@@ -4549,7 +4594,10 @@ def _fetch_robota_ua_postings(*, fetcher: Fetcher, source_query: str) -> list[Jo
     documents: list[dict[str, Any]] = []
     seen_documents: set[str] = set()
     for page in range(1, ROBOTA_UA_PAGE_LIMIT + 1):
-        payload = json.loads(fetcher(_robota_ua_page_url(source_query, page=page)))
+        payload = _fetch_robota_ua_json(
+            fetcher=fetcher,
+            url=_robota_ua_page_url(source_query, page=page),
+        )
         page_documents = payload.get("documents") if isinstance(payload, dict) else None
         if not isinstance(page_documents, list) or not page_documents:
             break
@@ -4603,7 +4651,10 @@ def _fetch_robota_ua_detail(*, fetcher: Fetcher, item: dict[str, Any]) -> dict[s
     if not vacancy_id:
         return None
     try:
-        payload = json.loads(fetcher(f"https://api.robota.ua/vacancy?id={vacancy_id}"))
+        payload = _fetch_robota_ua_json(
+            fetcher=fetcher,
+            url=f"https://api.robota.ua/vacancy?id={vacancy_id}",
+        )
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None

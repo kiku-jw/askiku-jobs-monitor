@@ -13,7 +13,8 @@ authors = [
   { name = "Nick / KikuAI" }
 ]
 dependencies = [
-  "certifi"
+  "certifi",
+  "requests>=2.32.0,<3"
 ]
 
 [project.scripts]

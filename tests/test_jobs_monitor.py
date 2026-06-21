@@ -488,6 +488,38 @@ class JobsMonitorTests(unittest.TestCase):
         self.assertEqual(calls[0]["context"], sentinel)
         self.assertEqual(calls[0]["timeout"], 18)
 
+    def test_robota_fetch_uses_requests_with_host_fallback(self) -> None:
+        calls: list[str] = []
+
+        class Response:
+            text = '{"documents":[]}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+        original_get = askiku_jobs.jobs.requests.get
+
+        def fake_get(url: str, *, headers: dict[str, str], timeout: int) -> Response:
+            calls.append(url)
+            self.assertEqual(timeout, 18)
+            self.assertIn("User-Agent", headers)
+            if "api.robota.ua" in url:
+                raise askiku_jobs.jobs.requests.HTTPError("cloudflare challenge")
+            return Response()
+
+        try:
+            askiku_jobs.jobs.requests.get = fake_get
+            payload = askiku_jobs.jobs._fetch_robota_ua_json(
+                fetcher=askiku_jobs.jobs._fetch_url,
+                url="https://api.robota.ua/vacancy/search?keyWords=python",
+            )
+        finally:
+            askiku_jobs.jobs.requests.get = original_get
+
+        self.assertEqual(payload, {"documents": []})
+        self.assertEqual(calls[0], "https://api.robota.ua/vacancy/search?keyWords=python")
+        self.assertEqual(calls[1], "https://ua-api.robota.ua/vacancy/search?keyWords=python")
+
     def test_work_ua_sidebar_reservation_filter_does_not_mark_last_card_as_reserved(self) -> None:
         postings = _parse_work_ua_html(
             WORK_HTML_WITH_SIDEBAR_RESERVATION_FILTER,
