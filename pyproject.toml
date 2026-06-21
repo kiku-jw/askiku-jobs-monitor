@@ -12,7 +12,9 @@ license = "MIT"
 authors = [
   { name = "Nick / KikuAI" }
 ]
-dependencies = []
+dependencies = [
+  "certifi"
+]
 
 [project.scripts]
 askiku-jobs = "askiku_jobs.cli:main"

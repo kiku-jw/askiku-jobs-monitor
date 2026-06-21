@@ -12,9 +12,10 @@ from pathlib import PurePosixPath
 import hashlib
 import json
 import re
+import ssl
 from typing import Any
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_opener, urlopen
 from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 
@@ -22,11 +23,14 @@ from .storage import Storage
 
 
 Fetcher = Callable[[str], str]
+_HTTPS_CONTEXT: ssl.SSLContext | None = None
 
 JOBS_SENT_STATE_KEY = "jobs.sent_fingerprints"
 JOBS_LAST_RUN_STATE_KEY = "jobs.last_run"
 JOBS_DIIA_CITY_REGISTRY_STATE_KEY = "jobs.diia_city_registry"
 JOBS_COMPANY_RESERVATION_EVIDENCE_STATE_KEY = "jobs.company_reservation_evidence"
+JOBS_COMPANY_VERIFICATION_EVIDENCE_STATE_KEY = "jobs.company_verification_evidence"
+JOBS_COMPANY_VERIFICATION_QUEUE_STATE_KEY = "jobs.company_verification_queue"
 JOBS_RESERVATION_EVIDENCE_LEDGER_STATE_KEY = "jobs.reservation_evidence_ledger"
 JOBS_SEEN_CANDIDATES_STATE_KEY = "jobs.seen_candidates"
 JOBS_SOURCE_WATERMARKS_STATE_KEY = "jobs.source_watermarks"
@@ -43,9 +47,24 @@ COMPANY_RESERVATION_DISCOVERY_LIMIT = 8
 COMPANY_RESERVATION_DISCOVERY_RUN_LIMIT = 12
 COMPANY_RESERVATION_DISCOVERY_PROMOTION_LIMIT = 3
 SEEN_CANDIDATES_LIMIT = 2000
+COMPANY_VERIFICATION_QUEUE_LIMIT = 500
 RESERVATION_EVIDENCE_LEDGER_LIMIT = 500
 DIIA_CITY_REGISTRY_URL = "https://city-backend.diia.gov.ua/api/front/registry/resident?page={page}"
-ALERTABLE_RESERVATION_CONFIDENCES = {"direct", "adjacent"}
+COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES = {
+    "employer_verified_manual",
+    "official_career_claim",
+    "official_criticality_decision",
+}
+COMPANY_VERIFICATION_HINT_EVIDENCE_TYPES = {"sector_hint"}
+COMPANY_VERIFICATION_EVIDENCE_TYPES = (
+    COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES
+    | COMPANY_VERIFICATION_HINT_EVIDENCE_TYPES
+)
+ALERTABLE_RESERVATION_CONFIDENCES = {
+    "direct",
+    "adjacent",
+    *COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES,
+}
 JOB_ALERT_MODES = {"new", "light", "heavy", "backfill"}
 LOCAL_JOB_TZ = ZoneInfo("Europe/Kyiv")
 LOCAL_JOB_MONTHS = {
@@ -76,7 +95,7 @@ LOCAL_JOB_MONTHS = {
 }
 USER_AGENT = (
     "AskikuJobMonitor/1.0 "
-    "(personal job search monitor; contact via repository owner)"
+    "(portable job search monitor; contact via repository owner)"
 )
 
 DOU_QUERIES = (
@@ -340,6 +359,14 @@ NON_EMPLOYEE_RESERVATION_PATTERNS = (
     r"\bброн[ье][\w-]*(?:вікн|окон|двер|скл|жилет|технік|автомоб)\w*",
     r"\barmou?red\s+(?:window|door|glass|vehicle|car)s?\b",
     r"\bbulletproof\s+(?:window|door|glass|vehicle|car)s?\b",
+)
+
+CRITICALITY_SIGNALS = (
+    "критично важлив",
+    "критически важн",
+    "critical enterprise",
+    "critical company",
+    "critical infrastructure",
 )
 
 NO_DEGREE_REQUIRED_SIGNALS = (
@@ -664,6 +691,7 @@ class JobPosting:
     posted_at: str = ""
     source_query: str = ""
     company_url: str = ""
+    reservation_evidence_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -842,6 +870,7 @@ def drain_jobs_alerts(
         diia_city_registry = set()
         problems.append("Diia.City registry unavailable")
     company_reservation_cache = _load_company_reservation_evidence_cache(storage)
+    company_verification_evidence = _load_company_verification_evidence(storage)
     source_company_reservation_evidence = _source_company_reservation_evidence(
         postings,
         cache=company_reservation_cache,
@@ -858,6 +887,8 @@ def drain_jobs_alerts(
             diia_city_registry=diia_city_registry,
             company_reservation_cache=company_reservation_cache,
             source_company_reservation_evidence=source_company_reservation_evidence,
+            company_verification_evidence=company_verification_evidence,
+            now=now,
         )
         for posting in postings
     ]
@@ -872,6 +903,8 @@ def drain_jobs_alerts(
         mode=mode,
         now=now,
         max_age_hours=max_age_hours,
+        storage=storage,
+        persist_company_verification_evidence=not dry_run,
     )
     _save_company_reservation_evidence_cache(storage, company_reservation_cache)
     _update_reservation_evidence_ledger(
@@ -880,6 +913,12 @@ def drain_jobs_alerts(
         company_reservation_cache=company_reservation_cache,
         now=now,
     )
+    if not dry_run:
+        _update_company_verification_evidence_from_scored(
+            storage=storage,
+            scored=scored,
+            now=now,
+        )
     selected_fingerprints: set[str] = set()
     alertable = [_is_alertable_job(item, min_score=min_score) for item in scored]
     freshness_reasons = [
@@ -935,7 +974,10 @@ def drain_jobs_alerts(
             freshness_reasons=freshness_reasons,
             min_score=min_score,
         )
+        _update_company_verification_queue_from_seen(storage=storage, now=now)
 
+    company_verification_queue = _load_company_verification_queue(storage)
+    company_verification_counts = _company_verification_evidence_counts(storage)
     status = {
         "ran_at": now.replace(microsecond=0).isoformat(),
         "mode": mode,
@@ -1021,6 +1063,18 @@ def drain_jobs_alerts(
         "source_health": _source_health_rows(postings=postings, problems=problems),
         "source_watermarks": len(source_watermarks),
         "seen_candidates": len(_load_seen_candidates(storage)),
+        "company_verification_queue_entries": len(company_verification_queue),
+        "company_verification_queue_companies": _company_verification_queue_company_count(
+            company_verification_queue
+        ),
+        "company_verification_queue_top": _company_verification_queue_top(
+            company_verification_queue
+        ),
+        "company_verification_evidence_entries": company_verification_counts.get(
+            "total",
+            0,
+        ),
+        "company_verification_evidence_counts": company_verification_counts,
         "near_misses": _near_miss_payloads(
             scored=scored,
             freshness_reasons=freshness_reasons,
@@ -1063,6 +1117,7 @@ def jobs_status_panel(storage: Storage) -> str:
     lines.append(f"Уже отправлено: {sent_count}")
 
     if not raw_status:
+        _append_live_company_verification_status(lines, storage)
         lines.append("Последний прогон: еще не было")
         return "\n".join(lines)
 
@@ -1148,6 +1203,49 @@ def jobs_status_panel(storage: Storage) -> str:
     seen_candidates = int(status.get("seen_candidates") or 0)
     if seen_candidates:
         lines.append(f"Seen candidates: {seen_candidates}")
+    company_verification_queue_entries = int(
+        status.get("company_verification_queue_entries") or 0
+    )
+    if company_verification_queue_entries:
+        company_verification_queue_companies = int(
+            status.get("company_verification_queue_companies") or 0
+        )
+        lines.append(
+            "Company verification queue: "
+            f"{company_verification_queue_entries} vacancies, "
+            f"{company_verification_queue_companies} companies"
+        )
+        top_queue = status.get("company_verification_queue_top")
+        if isinstance(top_queue, list) and top_queue:
+            parts: list[str] = []
+            for item in top_queue[:3]:
+                if not isinstance(item, dict):
+                    continue
+                company = str(item.get("company") or "unknown").strip()
+                score = int(item.get("score") or 0)
+                hints = item.get("verification_hints")
+                hint_label = ""
+                if isinstance(hints, list) and hints:
+                    hint_label = f" [{', '.join(str(value) for value in hints[:3])}]"
+                parts.append(f"{company}: {score}/100{hint_label}")
+            if parts:
+                lines.append("Top verification queue: " + "; ".join(parts))
+    company_verification_evidence_entries = int(
+        status.get("company_verification_evidence_entries") or 0
+    )
+    if company_verification_evidence_entries:
+        counts = status.get("company_verification_evidence_counts")
+        typed_counts = counts if isinstance(counts, dict) else {}
+        parts = [
+            f"{key}={int(value or 0)}"
+            for key, value in sorted(typed_counts.items())
+            if key != "total" and int(value or 0) > 0
+        ]
+        suffix = f" ({', '.join(parts[:6])})" if parts else ""
+        lines.append(
+            f"Company verification evidence: {company_verification_evidence_entries} entries"
+            f"{suffix}"
+        )
     problems = status.get("problems")
     if isinstance(problems, list) and problems:
         lines.append("Проблемы источников: " + "; ".join(str(item) for item in problems[:3]))
@@ -1164,6 +1262,37 @@ def jobs_status_panel(storage: Storage) -> str:
             reason = str(item.get("reason") or "скрыто фильтром").strip()
             lines.append(f"- {title}{company_label}: fit {score}/100; {reason}")
     return "\n".join(lines)
+
+
+def _append_live_company_verification_status(lines: list[str], storage: Storage) -> None:
+    queue = _load_company_verification_queue(storage)
+    if queue:
+        lines.append(
+            "Company verification queue: "
+            f"{len(queue)} vacancies, "
+            f"{_company_verification_queue_company_count(queue)} companies"
+        )
+        top_queue = _company_verification_queue_top(queue)
+        if top_queue:
+            parts = [
+                f"{str(item.get('company') or 'unknown').strip()}: "
+                f"{int(item.get('score') or 0)}/100"
+                for item in top_queue[:3]
+                if isinstance(item, dict)
+            ]
+            if parts:
+                lines.append("Top verification queue: " + "; ".join(parts))
+    counts = _company_verification_evidence_counts(storage)
+    entries = int(counts.get("total") or 0)
+    if not entries:
+        return
+    parts = [
+        f"{key}={int(value or 0)}"
+        for key, value in sorted(counts.items())
+        if key != "total" and int(value or 0) > 0
+    ]
+    suffix = f" ({', '.join(parts[:6])})" if parts else ""
+    lines.append(f"Company verification evidence: {entries} entries{suffix}")
 
 
 def _is_alertable_job(item: ScoredJob, *, min_score: int) -> bool:
@@ -1514,6 +1643,12 @@ def score_job(
         reasons.append("mentions reservation")
     elif reservation_confidence == "adjacent":
         reasons.append("company vacancies mention reservation")
+    elif reservation_confidence == "official_career_claim":
+        reasons.append("company career page mentions reservation")
+    elif reservation_confidence == "employer_verified_manual":
+        reasons.append("manual employer reservation verification")
+    elif reservation_confidence == "official_criticality_decision":
+        reasons.append("official criticality decision")
     elif reservation_confidence == "diia-city":
         reasons.append("Diia.City resident")
 
@@ -1571,6 +1706,8 @@ def _score_job_with_known_reservation(
     diia_city_registry: set[str],
     company_reservation_cache: dict[str, CompanyReservationEvidenceCacheEntry],
     source_company_reservation_evidence: dict[str, ReservationEvidence],
+    company_verification_evidence: dict[str, dict[str, Any]],
+    now: datetime,
 ) -> ScoredJob:
     diia_city_resident = _is_diia_city_resident(posting.company, diia_city_registry)
     initial = score_job(posting, diia_city_resident=diia_city_resident)
@@ -1601,6 +1738,18 @@ def _score_job_with_known_reservation(
             diia_city_resident=diia_city_resident,
             reservation_evidence=(source_company_evidence,),
         )
+    verified_company_evidence = _company_verification_evidence_for_posting(
+        posting,
+        company_verification_evidence,
+        now=now,
+    )
+    if verified_company_evidence is not None:
+        return score_job(
+            posting,
+            reservation_confidence=verified_company_evidence.kind,
+            diia_city_resident=diia_city_resident,
+            reservation_evidence=(verified_company_evidence,),
+        )
     return initial
 
 
@@ -1616,6 +1765,8 @@ def _apply_company_discovery_to_ranked_near_misses(
     mode: str,
     now: datetime,
     max_age_hours: int,
+    storage: Storage,
+    persist_company_verification_evidence: bool,
 ) -> list[ScoredJob]:
     if not fetch_budget or fetch_budget[0] <= 0:
         return scored
@@ -1663,9 +1814,26 @@ def _apply_company_discovery_to_ranked_near_misses(
         )
         if evidence is None:
             continue
+        if (
+            persist_company_verification_evidence
+            and evidence.kind in COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES
+        ):
+            record_company_verification_evidence(
+                storage=storage,
+                company=item.posting.company,
+                evidence_type=evidence.kind,
+                source_url=evidence.source_url,
+                quote=evidence.quote,
+                source="discovery",
+                now=now,
+            )
         updated[index] = score_job(
             item.posting,
-            reservation_confidence="adjacent",
+            reservation_confidence=(
+                evidence.kind
+                if evidence.kind in COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES
+                else "adjacent"
+            ),
             diia_city_resident=item.diia_city_resident,
             reservation_evidence=(evidence,),
         )
@@ -1788,6 +1956,22 @@ def _company_discovery_reservation_evidence(
     )
     if company_evidence is not None:
         return company_evidence
+    career_evidence = _company_owned_career_reservation_evidence(
+        posting,
+        fetcher=fetcher,
+        cache=cache,
+        fetch_budget=fetch_budget,
+    )
+    if career_evidence is not None:
+        return career_evidence
+    criticality_evidence = _official_criticality_reservation_evidence(
+        posting,
+        fetcher=fetcher,
+        cache=cache,
+        fetch_budget=fetch_budget,
+    )
+    if criticality_evidence is not None:
+        return criticality_evidence
     return _company_search_reservation_evidence(
         posting,
         fetcher=fetcher,
@@ -1803,6 +1987,298 @@ def _company_vacancies_url(posting: JobPosting) -> str:
     if match is None:
         return ""
     return f"https://jobs.dou.ua/companies/{match.group(1)}/vacancies/"
+
+
+def _company_owned_career_reservation_evidence(
+    posting: JobPosting,
+    *,
+    fetcher: Fetcher,
+    cache: dict[str, CompanyReservationEvidenceCacheEntry],
+    fetch_budget: list[int],
+) -> ReservationEvidence | None:
+    company_url = _company_vacancies_url(posting)
+    if not company_url:
+        return None
+    identities = sorted(_company_identity_keys(posting.company))
+    cache_identity = identities[0] if identities else _normalize_company_name(posting.company)
+    cache_key = f"official-career:{cache_identity}:{company_url}"
+    if cache_key in cache:
+        return cache[cache_key].evidence
+    if not fetch_budget or fetch_budget[0] <= 0:
+        return None
+    fetch_budget[0] -= 1
+    try:
+        company_page = fetcher(company_url)
+    except Exception:
+        cache[cache_key] = CompanyReservationEvidenceCacheEntry(
+            checked_at=_utc_now_iso(),
+            evidence=None,
+        )
+        return None
+
+    evidence: ReservationEvidence | None = None
+    for url in _official_career_urls_from_html(company_page, base_url=company_url):
+        if not fetch_budget or fetch_budget[0] <= 0:
+            break
+        fetch_budget[0] -= 1
+        try:
+            page = fetcher(url)
+        except Exception:
+            continue
+        evidence = _reservation_evidence_from_text(
+            page,
+            kind="official_career_claim",
+            source_url=url,
+        )
+        if evidence is not None:
+            break
+
+    cache[cache_key] = CompanyReservationEvidenceCacheEntry(
+        checked_at=_utc_now_iso(),
+        evidence=evidence,
+    )
+    return evidence
+
+
+def _official_career_urls_from_html(text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"""href=(["'])(?P<href>[^"']+)\1""", text, flags=re.IGNORECASE):
+        url = urljoin(base_url, unescape(match.group("href")).strip())
+        if not _is_company_owned_career_url(url):
+            continue
+        canonical = _canonical_url(url)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        urls.append(url)
+    return urls[:4]
+
+
+def _is_company_owned_career_url(url: str) -> bool:
+    split = urlsplit(url)
+    if split.scheme not in {"http", "https"} or not split.netloc:
+        return False
+    if _is_job_board_or_search_domain(split.netloc):
+        return False
+    path = split.path.lower()
+    return any(
+        signal in path
+        for signal in (
+            "career",
+            "careers",
+            "vacanc",
+            "jobs",
+            "join",
+            "team",
+            "work",
+        )
+    )
+
+
+def _official_criticality_reservation_evidence(
+    posting: JobPosting,
+    *,
+    fetcher: Fetcher,
+    cache: dict[str, CompanyReservationEvidenceCacheEntry],
+    fetch_budget: list[int],
+) -> ReservationEvidence | None:
+    edrpou_values = _posting_edrpou_values(posting)
+    legal_names = _posting_legal_names(posting)
+    if not edrpou_values and not legal_names:
+        return None
+    identities = sorted(_company_identity_keys(posting.company))
+    cache_identity = identities[0] if identities else _normalize_company_name(posting.company)
+    cache_key = (
+        "official-criticality:"
+        f"{cache_identity}:{','.join(edrpou_values)}:{','.join(legal_names)}"
+    )
+    if cache_key in cache:
+        return cache[cache_key].evidence
+    if not fetch_budget or fetch_budget[0] <= 0:
+        return None
+    fetch_budget[0] -= 1
+    try:
+        search_page = fetcher(
+            _official_criticality_search_url(
+                company=posting.company,
+                edrpou_values=edrpou_values,
+                legal_names=legal_names,
+            )
+        )
+    except Exception:
+        cache[cache_key] = CompanyReservationEvidenceCacheEntry(
+            checked_at=_utc_now_iso(),
+            evidence=None,
+        )
+        return None
+
+    evidence: ReservationEvidence | None = None
+    for url in _official_criticality_candidate_urls(search_page):
+        if not fetch_budget or fetch_budget[0] <= 0:
+            break
+        fetch_budget[0] -= 1
+        try:
+            page = fetcher(url)
+        except Exception:
+            continue
+        quote = _official_criticality_quote_for_match(
+            page,
+            edrpou_values=edrpou_values,
+            legal_names=legal_names,
+        )
+        if quote:
+            evidence = ReservationEvidence(
+                kind="official_criticality_decision",
+                source_url=url,
+                quote=quote,
+            )
+            break
+
+    cache[cache_key] = CompanyReservationEvidenceCacheEntry(
+        checked_at=_utc_now_iso(),
+        evidence=evidence,
+    )
+    return evidence
+
+
+def _official_criticality_search_url(
+    *,
+    company: str,
+    edrpou_values: tuple[str, ...],
+    legal_names: tuple[str, ...],
+) -> str:
+    query = " ".join(
+        part
+        for part in (
+            company,
+            " ".join(legal_names),
+            " ".join(edrpou_values),
+            "критично важливе підприємство бронювання",
+        )
+        if part
+    )
+    return f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+
+
+def _official_criticality_candidate_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"""href=(["'])(?P<href>[^"']+)\1""", text, flags=re.IGNORECASE):
+        url = _extract_search_result_url(unescape(match.group("href")).strip())
+        if not url or not _is_official_public_authority_url(url):
+            continue
+        canonical = _canonical_url(url)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        urls.append(url)
+    return urls[:4]
+
+
+def _extract_search_result_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    url = urljoin("https://duckduckgo.com/html/", raw_url)
+    params = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
+    redirected = str(params.get("uddg") or "").strip()
+    return redirected or url
+
+
+def _is_official_public_authority_url(url: str) -> bool:
+    split = urlsplit(url)
+    if split.scheme not in {"http", "https"}:
+        return False
+    host = split.netloc.lower().removeprefix("www.")
+    if _is_job_board_or_search_domain(host):
+        return False
+    return (
+        host == "gov.ua"
+        or host.endswith(".gov.ua")
+        or host == "mil.gov.ua"
+        or host.endswith(".mil.gov.ua")
+    )
+
+
+def _is_job_board_or_search_domain(host: str) -> bool:
+    host = host.lower().removeprefix("www.")
+    return (
+        host.endswith("work.ua")
+        or host.endswith("robota.ua")
+        or host.endswith("jobs.dou.ua")
+        or host.endswith("djinni.co")
+        or host.endswith("happymonday.ua")
+        or host.endswith("jobs.ua")
+        or host.endswith("duckduckgo.com")
+        or host.endswith("google.com")
+        or host.endswith("bing.com")
+    )
+
+
+def _posting_edrpou_values(posting: JobPosting) -> tuple[str, ...]:
+    text = _strip_html(_score_text(posting))
+    values = []
+    for match in re.finditer(
+        r"(?:єдрпоу|едрпоу|edrpou)\D{0,16}(?P<value>\d{8,10})",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        values.append(match.group("value"))
+    return tuple(_dedupe_strings(values))
+
+
+def _posting_legal_names(posting: JobPosting) -> tuple[str, ...]:
+    text = _strip_html(_score_text(posting))
+    values: list[str] = []
+    pattern = (
+        r"\b(?P<form>ТОВ|ТЗОВ|ПП|АТ|ПрАТ|ДП)\s*"
+        r"[\"'«“„]?(?P<name>[^\"'»”“,.;:\n<>]{2,90})"
+    )
+    for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+        form = match.group("form").strip()
+        name = match.group("name").strip(" -")
+        if name:
+            values.append(f"{form} {name}")
+    return tuple(_dedupe_strings(values))
+
+
+def _official_criticality_quote_for_match(
+    text: str,
+    *,
+    edrpou_values: tuple[str, ...],
+    legal_names: tuple[str, ...],
+) -> str:
+    clean = re.sub(r"\s+", " ", _strip_html(text)).strip()
+    lowered = clean.lower()
+    if not any(signal in lowered for signal in CRITICALITY_SIGNALS):
+        return ""
+    if edrpou_values and any(value in clean for value in edrpou_values):
+        return _criticality_quote(clean)
+    normalized_page = _normalize_legal_match_text(clean)
+    if any(
+        _normalize_legal_match_text(legal_name) in normalized_page
+        for legal_name in legal_names
+        if legal_name
+    ):
+        return _criticality_quote(clean)
+    return ""
+
+
+def _criticality_quote(text: str) -> str:
+    parts = [
+        part.strip(" -:;,.")
+        for part in re.split(r"(?<=[.!?])\s+|\s+[•|]\s+", text)
+        if part.strip(" -:;,.")
+    ]
+    for part in parts:
+        if any(signal in part.lower() for signal in CRITICALITY_SIGNALS):
+            return _truncate(part, 180)
+    return _truncate(text, 180)
+
+
+def _normalize_legal_match_text(value: str) -> str:
+    lowered = value.lower()
+    return re.sub(r"[^\w]+", " ", lowered, flags=re.UNICODE).strip()
 
 
 def _company_search_reservation_evidence(
@@ -1974,6 +2450,410 @@ def _save_seen_candidates(storage: Storage, seen: dict[str, dict[str, Any]]) -> 
         JOBS_SEEN_CANDIDATES_STATE_KEY,
         json.dumps(dict(capped), ensure_ascii=False, sort_keys=True),
     )
+
+
+def _load_company_verification_queue(storage: Storage) -> dict[str, dict[str, Any]]:
+    raw = storage.get_state(JOBS_COMPANY_VERIFICATION_QUEUE_STATE_KEY)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for fingerprint, value in payload.items():
+        key = str(fingerprint).strip()
+        if not key or not isinstance(value, dict):
+            continue
+        result[key] = value
+    return result
+
+
+def record_company_verification_evidence(
+    *,
+    storage: Storage,
+    company: str,
+    evidence_type: str,
+    source_url: str,
+    quote: str,
+    reviewer_note: str = "",
+    source: str = "manual",
+    company_legal_name: str = "",
+    company_edrpou: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    company = str(company or "").strip()
+    evidence_type = str(evidence_type or "").strip()
+    source_url = str(source_url or "").strip()
+    quote = re.sub(r"\s+", " ", str(quote or "")).strip()
+    reviewer_note = re.sub(r"\s+", " ", str(reviewer_note or "")).strip()
+    source = str(source or "manual").strip() or "manual"
+    company_legal_name = re.sub(r"\s+", " ", str(company_legal_name or "")).strip()
+    company_edrpou = re.sub(r"\D+", "", str(company_edrpou or "")).strip()
+    identities = sorted(_company_identity_keys(company))
+    error = _company_verification_evidence_validation_error(
+        company=company,
+        identities=identities,
+        evidence_type=evidence_type,
+        source_url=source_url,
+        quote=quote,
+        reviewer_note=reviewer_note,
+    )
+    if error:
+        return {"stored": False, "error": error, "record": {}}
+
+    ledger = _load_company_verification_evidence(storage)
+    now_iso = now.replace(microsecond=0).isoformat()
+    key = _company_verification_evidence_key(
+        company_identity=identities[0],
+        evidence_type=evidence_type,
+        source_url=source_url,
+        quote=quote,
+    )
+    previous = ledger.get(key, {})
+    first_seen = str(previous.get("first_seen") or now_iso)
+    record = {
+        "company": company,
+        "company_identities": identities,
+        "company_identity": identities[0],
+        "company_legal_name": company_legal_name,
+        "company_edrpou": company_edrpou,
+        "evidence_type": evidence_type,
+        "source": source,
+        "source_url": source_url,
+        "quote": _truncate(quote, 240),
+        "reviewer_note": _truncate(reviewer_note, 240),
+        "first_seen": first_seen,
+        "last_verified": now_iso,
+        "expires_at": (
+            now + COMPANY_RESERVATION_EVIDENCE_POSITIVE_TTL
+        ).replace(microsecond=0).isoformat(),
+    }
+    ledger[key] = record
+    _save_company_verification_evidence(storage, ledger)
+    return {"stored": True, "error": "", "record": record}
+
+
+def _company_verification_evidence_validation_error(
+    *,
+    company: str,
+    identities: list[str],
+    evidence_type: str,
+    source_url: str,
+    quote: str,
+    reviewer_note: str,
+) -> str:
+    if evidence_type not in COMPANY_VERIFICATION_EVIDENCE_TYPES:
+        return "unsupported_evidence_type"
+    if not company or not identities:
+        return "missing_company_identity"
+    if not quote:
+        return "missing_quote"
+    if evidence_type != "sector_hint" and not source_url:
+        return "missing_source_url"
+    if evidence_type == "employer_verified_manual" and not reviewer_note:
+        return "missing_reviewer_note"
+    return ""
+
+
+def _company_verification_evidence_key(
+    *,
+    company_identity: str,
+    evidence_type: str,
+    source_url: str,
+    quote: str,
+) -> str:
+    source_key = source_url or hashlib.sha256(quote.encode("utf-8")).hexdigest()[:16]
+    return f"{company_identity}|{evidence_type}|{source_key}"
+
+
+def _load_company_verification_evidence(storage: Storage) -> dict[str, dict[str, Any]]:
+    raw = storage.get_state(JOBS_COMPANY_VERIFICATION_EVIDENCE_STATE_KEY)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    rows = payload.values() if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) and not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        evidence_type = str(row.get("evidence_type") or "").strip()
+        source_url = str(row.get("source_url") or "").strip()
+        quote = str(row.get("quote") or "").strip()
+        identities = _company_verification_record_identities(row)
+        if not identities or not evidence_type or not quote:
+            continue
+        key = _company_verification_evidence_key(
+            company_identity=identities[0],
+            evidence_type=evidence_type,
+            source_url=source_url,
+            quote=quote,
+        )
+        row["company_identities"] = identities
+        result[key] = row
+    return result
+
+
+def _save_company_verification_evidence(
+    storage: Storage,
+    ledger: dict[str, dict[str, Any]],
+) -> None:
+    capped = sorted(
+        ledger.items(),
+        key=lambda item: str(item[1].get("last_verified") or ""),
+    )[-RESERVATION_EVIDENCE_LEDGER_LIMIT:]
+    storage.set_state(
+        JOBS_COMPANY_VERIFICATION_EVIDENCE_STATE_KEY,
+        json.dumps(dict(capped), ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _company_verification_record_identities(row: dict[str, Any]) -> list[str]:
+    identities: list[str] = []
+    raw_identities = row.get("company_identities")
+    if isinstance(raw_identities, list):
+        for value in raw_identities:
+            identity = str(value).strip()
+            if identity:
+                identities.append(identity)
+    identity = str(row.get("company_identity") or "").strip()
+    if identity:
+        identities.append(identity)
+    company = str(row.get("company") or "").strip()
+    identities.extend(sorted(_company_identity_keys(company)))
+    return _dedupe_strings(identities)
+
+
+def _company_verification_evidence_for_posting(
+    posting: JobPosting,
+    ledger: dict[str, dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> ReservationEvidence | None:
+    posting_identities = _company_identity_keys(posting.company)
+    if not posting_identities:
+        return None
+    best: dict[str, Any] | None = None
+    for row in ledger.values():
+        evidence_type = str(row.get("evidence_type") or "").strip()
+        if evidence_type not in COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES:
+            continue
+        if not _company_verification_record_is_fresh(row, now=now):
+            continue
+        row_identities = set(_company_verification_record_identities(row))
+        if not posting_identities & row_identities:
+            continue
+        if best is None or str(row.get("last_verified") or "") > str(
+            best.get("last_verified") or ""
+        ):
+            best = row
+    if best is None:
+        return None
+    source_url = str(best.get("source_url") or "").strip()
+    quote = str(best.get("quote") or "").strip()
+    evidence_type = str(best.get("evidence_type") or "").strip()
+    if not source_url or not quote:
+        return None
+    return ReservationEvidence(kind=evidence_type, source_url=source_url, quote=quote)
+
+
+def _company_verification_record_is_fresh(
+    row: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    expires_at = str(row.get("expires_at") or "").strip()
+    if not expires_at:
+        return True
+    try:
+        expires = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    reference = (now or datetime.now(UTC)).astimezone(UTC)
+    return expires > reference
+
+
+def _company_verification_hints_for_company(
+    company: str,
+    ledger: dict[str, dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    company_identities = _company_identity_keys(company)
+    hints: list[str] = []
+    for row in ledger.values():
+        evidence_type = str(row.get("evidence_type") or "").strip()
+        if evidence_type not in COMPANY_VERIFICATION_HINT_EVIDENCE_TYPES:
+            continue
+        if not _company_verification_record_is_fresh(row, now=now):
+            continue
+        row_identities = set(_company_verification_record_identities(row))
+        if company_identities & row_identities:
+            hints.append(evidence_type)
+    return _dedupe_strings(hints)
+
+
+def _update_company_verification_evidence_from_scored(
+    *,
+    storage: Storage,
+    scored: list[ScoredJob],
+    now: datetime,
+) -> None:
+    for item in scored:
+        for evidence in item.reservation_evidence:
+            if evidence.kind not in COMPANY_VERIFICATION_ALERTABLE_EVIDENCE_TYPES:
+                continue
+            record_company_verification_evidence(
+                storage=storage,
+                company=item.posting.company,
+                evidence_type=evidence.kind,
+                source_url=evidence.source_url,
+                quote=evidence.quote,
+                source="scored",
+                now=now,
+            )
+
+
+def _save_company_verification_queue(
+    storage: Storage,
+    queue: dict[str, dict[str, Any]],
+) -> None:
+    capped = sorted(
+        queue.items(),
+        key=lambda item: str(item[1].get("last_seen") or ""),
+    )[-COMPANY_VERIFICATION_QUEUE_LIMIT:]
+    storage.set_state(
+        JOBS_COMPANY_VERIFICATION_QUEUE_STATE_KEY,
+        json.dumps(dict(capped), ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _update_company_verification_queue_from_seen(
+    *,
+    storage: Storage,
+    now: datetime,
+) -> None:
+    previous_queue = _load_company_verification_queue(storage)
+    verification_evidence = _load_company_verification_evidence(storage)
+    seen = _load_seen_candidates(storage)
+    now_iso = now.replace(microsecond=0).isoformat()
+    queue: dict[str, dict[str, Any]] = {}
+    for fingerprint, row in seen.items():
+        if row.get("status") != "waiting_reservation_evidence":
+            continue
+        company = str(row.get("company") or "").strip()
+        identities = sorted(_company_identity_keys(company))
+        if not company or not identities:
+            continue
+        previous = previous_queue.get(fingerprint)
+        first_queued = (
+            str(previous.get("first_queued") or "")
+            if isinstance(previous, dict)
+            else ""
+        )
+        queue[fingerprint] = {
+            "fingerprint": fingerprint,
+            "first_queued": first_queued or now_iso,
+            "last_seen": str(row.get("last_seen") or now_iso),
+            "recheck_after": str(row.get("recheck_after") or ""),
+            "posted_at": str(row.get("posted_at") or ""),
+            "source": str(row.get("source") or ""),
+            "source_query": str(row.get("source_query") or ""),
+            "title": str(row.get("title") or ""),
+            "company": company,
+            "company_identities": identities,
+            "url": str(row.get("url") or ""),
+            "score": int(row.get("score") or 0),
+            "remote": bool(row.get("remote")),
+            "reason": "missing_reservation_evidence",
+            "status": "queued",
+            "verification_hints": _company_verification_hints_for_company(
+                company,
+                verification_evidence,
+                now=now,
+            ),
+        }
+    _save_company_verification_queue(storage, queue)
+
+
+def _company_verification_queue_company_count(
+    queue: dict[str, dict[str, Any]],
+) -> int:
+    identities: set[str] = set()
+    for row in queue.values():
+        raw_identities = row.get("company_identities")
+        if not isinstance(raw_identities, list):
+            continue
+        for value in raw_identities:
+            identity = str(value).strip()
+            if identity:
+                identities.add(identity)
+    return len(identities)
+
+
+def _company_verification_queue_top(
+    queue: dict[str, dict[str, Any]],
+    *,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    rows = sorted(
+        queue.values(),
+        key=lambda row: (
+            int(row.get("score") or 0),
+            str(row.get("last_seen") or ""),
+            str(row.get("title") or ""),
+        ),
+        reverse=True,
+    )
+    result: list[dict[str, Any]] = []
+    for row in rows[: max(0, limit)]:
+        hints = row.get("verification_hints")
+        result.append(
+            {
+                "company": str(row.get("company") or ""),
+                "title": str(row.get("title") or ""),
+                "score": int(row.get("score") or 0),
+                "url": str(row.get("url") or ""),
+                "verification_hints": hints if isinstance(hints, list) else [],
+            }
+        )
+    return result
+
+
+def _company_verification_evidence_counts(storage: Storage) -> dict[str, int]:
+    raw = storage.get_state(JOBS_COMPANY_VERIFICATION_EVIDENCE_STATE_KEY)
+    counts: dict[str, int] = {"total": 0}
+    if not raw:
+        return counts
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return counts
+    if isinstance(payload, dict):
+        rows = list(payload.values())
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        return counts
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        evidence_type = str(row.get("evidence_type") or "unknown").strip()
+        if not evidence_type:
+            evidence_type = "unknown"
+        counts["total"] += 1
+        counts[evidence_type] = counts.get(evidence_type, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _update_seen_candidates(
@@ -2587,7 +3467,7 @@ def _strip_non_employee_reservation_noise(text: str) -> str:
 def _reservation_evidence_from_posting(posting: JobPosting) -> ReservationEvidence | None:
     return _reservation_evidence_from_text(
         _score_text(posting),
-        kind="direct",
+        kind=posting.reservation_evidence_kind or "direct",
         source_url=posting.url,
     )
 
@@ -2692,11 +3572,31 @@ def _fetch_url(url: str, *, max_bytes: int | None = None) -> str:
             "Accept": "application/json,text/html,application/rss+xml",
         },
     )
-    with urlopen(request, timeout=18) as response:
+    with urlopen(request, timeout=18, context=_https_context()) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         if max_bytes is not None:
             return response.read(max(1, int(max_bytes))).decode(charset, errors="ignore")
         return response.read().decode(charset, errors="ignore")
+
+
+def _https_context() -> ssl.SSLContext:
+    global _HTTPS_CONTEXT
+    if _HTTPS_CONTEXT is not None:
+        return _HTTPS_CONTEXT
+    cafile = ""
+    try:
+        certifi = importlib.import_module("certifi")
+        where = getattr(certifi, "where", None)
+        if callable(where):
+            cafile = str(where()).strip()
+    except Exception:
+        cafile = ""
+    _HTTPS_CONTEXT = (
+        ssl.create_default_context(cafile=cafile)
+        if cafile
+        else ssl.create_default_context()
+    )
+    return _HTTPS_CONTEXT
 
 
 def _fetch_with_budget(fetcher: Fetcher, url: str, *, max_bytes: int) -> str:
@@ -2761,7 +3661,10 @@ def _fetch_dou_xhr_payload(*, fetcher: Fetcher, query: str, count: int) -> str:
         return fetcher(_dou_xhr_url(query, count=count))
     page_url = _dou_search_url(query)
     jar = CookieJar()
-    opener = build_opener(HTTPCookieProcessor(jar))
+    opener = build_opener(
+        HTTPCookieProcessor(jar),
+        HTTPSHandler(context=_https_context()),
+    )
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html",
@@ -3604,7 +4507,8 @@ def _parse_work_ua_html(text: str, *, source_query: str) -> list[JobPosting]:
             flags=re.IGNORECASE | re.DOTALL,
         )
         summary_parts = [_strip_html(summary_match.group("summary"))] if summary_match else []
-        if _work_ua_card_has_reservation_badge(block) and not _has_reservation_signal(
+        has_reservation_badge = _work_ua_card_has_reservation_badge(block)
+        if has_reservation_badge and not _has_reservation_signal(
             " ".join(summary_parts).lower()
         ):
             summary_parts.append("Бронювання працівників.")
@@ -3625,6 +4529,9 @@ def _parse_work_ua_html(text: str, *, source_query: str) -> list[JobPosting]:
                 posted_at=posted_at,
                 source_query=source_query,
                 company_url=company_href,
+                reservation_evidence_kind=(
+                    "platform_badge" if has_reservation_badge else ""
+                ),
             )
         )
     return postings
@@ -3710,6 +4617,9 @@ def _robota_posting_from_item(item: dict[str, Any], *, source_query: str) -> Job
     if not vacancy_id or not company_id or not title:
         return None
     badge_names = _robota_badge_names(item)
+    has_reservation_badge = any(
+        _has_reservation_signal(name.lower()) for name in badge_names
+    )
     summary_parts = [
         str(item.get("description") or "").strip(),
         str(item.get("shortDescription") or "").strip(),
@@ -3729,6 +4639,7 @@ def _robota_posting_from_item(item: dict[str, Any], *, source_query: str) -> Job
         posted_at=str(item.get("date") or "").strip(),
         source_query=source_query,
         company_url=f"https://api.robota.ua/companies/{company_id}/published-vacancies",
+        reservation_evidence_kind="platform_badge" if has_reservation_badge else "",
     )
 
 
@@ -3890,6 +4801,9 @@ def _reservation_label(value: str) -> str:
     return {
         "direct": "упомянута",
         "adjacent": "есть в соседних вакансиях компании",
+        "official_career_claim": "на career page компании",
+        "employer_verified_manual": "подтверждена вручную",
+        "official_criticality_decision": "official criticality evidence",
         "diia-city": "Diia.City resident",
         "unknown": "неясно",
     }.get(value, value or "неясно")
@@ -3898,7 +4812,11 @@ def _reservation_label(value: str) -> str:
 def _reservation_evidence_label(value: str) -> str:
     return {
         "direct": "вакансия",
+        "platform_badge": "бейдж платформы",
         "adjacent": "соседние вакансии компании",
+        "official_career_claim": "career page компании",
+        "employer_verified_manual": "ручная HR-проверка",
+        "official_criticality_decision": "official criticality page",
     }.get(value, value or "источник")
 
 
