@@ -6,6 +6,14 @@ It searches Ukrainian job boards for remote IT roles, keeps strict reservation e
 
 It also keeps a review queue for companies whose vacancies look relevant but lack direct reservation evidence. Verified employer evidence can be recorded back into the same SQLite state and used by later scans.
 
+Primary CTA: run a dry local scan and inspect the digest before wiring it into
+any operator surface.
+
+```bash
+askiku-jobs run --mode heavy --dry-run --limit 3
+askiku-jobs status
+```
+
 ## Current Gate Policy
 
 Shown candidates must have:
@@ -84,9 +92,21 @@ print(result["message"] or "[SILENT]")
 - `verify-company` supports `official_career_claim`, `official_criticality_decision`, `employer_verified_manual`, and `sector_hint`.
 - HTTPS fetching uses `certifi` so local Python CA-store issues are less likely to make every source look empty.
 
+## Expected Output
+
+The CLI writes local SQLite state and prints a compact digest. In dry-run mode
+it does not mark candidates as sent.
+
+The monitor is an evidence gate for an operator workflow. It is not a public
+job board, recruiter CRM, or automatic application system.
+
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile src/askiku_jobs/jobs.py src/askiku_jobs/storage.py src/askiku_jobs/cli.py
 ```
+
+## License
+
+MIT.
