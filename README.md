@@ -6,8 +6,15 @@ It searches Ukrainian job boards for remote IT roles, keeps strict reservation e
 
 It also keeps a review queue for companies whose vacancies look relevant but lack direct reservation evidence. Verified employer evidence can be recorded back into the same SQLite state and used by later scans.
 
-Primary CTA: run a dry local scan and inspect the digest before wiring it into
-any operator surface.
+**[Run a dry local scan](#quick-start)**
+
+[Docs](#current-gate-policy) · [Examples](#quick-start) · [Expected output](#expected-output)
+
+Sample output:
+
+```text
+[SILENT] or a compact dry-run digest with reservation evidence
+```
 
 ```bash
 askiku-jobs run --mode heavy --dry-run --limit 3
